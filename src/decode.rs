@@ -29,7 +29,7 @@
 //! bits, or not 4:2:0 is rejected rather than decoded wrongly. That covers every
 //! stream this crate's encoder, WebRTC, or a browser's `VideoEncoder` produces.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -44,11 +44,12 @@ use crate::codec::h264::parser::{
 };
 use crate::codec::h264::picture::{Field, IsIdr, PictureData, Reference};
 use crate::{
-	bindings, Buffer, BufferType, Config as VaConfig, Context, Display, H264PicFields, H264SeqFields, IQMatrix,
-	IQMatrixBufferH264, Image, Picture, PictureH264, PictureParameter, PictureParameterBufferH264, SliceParameter,
-	SliceParameterBufferH264, Surface, UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
-	VA_FOURCC_NV12, VA_INVALID_ID, VA_PICTURE_H264_INVALID, VA_PICTURE_H264_LONG_TERM_REFERENCE,
-	VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RT_FORMAT_YUV420, VA_SLICE_DATA_FLAG_ALL,
+	bindings, Buffer, BufferType, Config as VaConfig, Context, Display, DrmPrimeSurfaceDescriptor, H264PicFields,
+	H264SeqFields, IQMatrix, IQMatrixBufferH264, Image, Picture, PictureH264, PictureParameter,
+	PictureParameterBufferH264, SliceParameter, SliceParameterBufferH264, Surface, UsageHint, VAConfigAttrib,
+	VAConfigAttribType, VAEntrypoint, VAProfile, VA_FOURCC_NV12, VA_INVALID_ID, VA_PICTURE_H264_INVALID,
+	VA_PICTURE_H264_LONG_TERM_REFERENCE, VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RT_FORMAT_YUV420,
+	VA_SLICE_DATA_FLAG_ALL,
 };
 
 /// H.264 decoder configuration.
@@ -86,6 +87,42 @@ pub struct Frame {
 	/// NV12 planes with no row padding: `width * height` luma bytes followed by
 	/// `width * height / 2` interleaved chroma bytes.
 	pub data: Vec<u8>,
+}
+
+/// One decoded picture, left in the surface the hardware wrote it into.
+///
+/// The GPU counterpart of [`Frame`]: same picture, same timestamp, but a DRM
+/// PRIME descriptor for the surface rather than a copy of its pixels. The
+/// descriptor owns the exported file descriptors and keeps the allocation alive
+/// on its own, so the surface behind it is already gone by the time this is
+/// handed over.
+///
+/// NV12, and one object holding both planes, which is what the Intel and AMD
+/// drivers export. Read the modifier off the object before assuming anything
+/// about the layout: a decode target is tiled, and the plane pitches carry
+/// padding the visible size does not imply.
+pub struct ExportedFrame {
+	/// Timestamp of the access unit this picture was coded in, as handed to
+	/// [`Decoder::decode_exported`].
+	pub timestamp: u64,
+	/// Visible width in pixels, i.e. after the SPS cropping rectangle.
+	pub width: u32,
+	/// Visible height in pixels.
+	pub height: u32,
+	/// The surface's export: format, modifier, and the offset and pitch of each
+	/// plane.
+	pub descriptor: DrmPrimeSurfaceDescriptor,
+}
+
+impl std::fmt::Debug for ExportedFrame {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ExportedFrame")
+			.field("timestamp", &self.timestamp)
+			.field("width", &self.width)
+			.field("height", &self.height)
+			.field("fourcc", &self.descriptor.fourcc)
+			.finish()
+	}
 }
 
 impl std::fmt::Debug for Frame {
@@ -151,6 +188,32 @@ impl Decoder {
 	/// stream, so an access unit carrying only an SPS and a PPS decodes to no
 	/// frames.
 	pub fn decode(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<Vec<Frame>> {
+		self.submit(access_unit, timestamp)?;
+		self.take_frames()
+	}
+
+	/// Decodes one Annex-B access unit, leaving the pictures that came due on
+	/// the GPU.
+	///
+	/// The same decode as [`Decoder::decode`], differing only in what the caller
+	/// gets back: a DRM PRIME descriptor for each picture's surface instead of a
+	/// copy of its pixels. For a consumer that draws on the GPU that is the
+	/// whole picture never touching system memory.
+	///
+	/// Exporting a surface retires it from the recycling pool, since the next
+	/// picture would otherwise be decoded over pixels the consumer still holds a
+	/// descriptor for. So this trades a surface allocation per picture for the
+	/// download, which is the right way round for anything that would only have
+	/// uploaded the pixels again.
+	pub fn decode_exported(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<Vec<ExportedFrame>> {
+		self.submit(access_unit, timestamp)?;
+		self.take_exported()
+	}
+
+	/// Decodes one access unit, leaving the pictures that came due in the ready
+	/// queue for whichever of [`Decoder::take_frames`] or
+	/// [`Decoder::take_exported`] the caller asked for.
+	fn submit(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<()> {
 		let mut cursor = Cursor::new(access_unit);
 		let mut current: Option<CurrentPicture> = None;
 
@@ -200,22 +263,39 @@ impl Decoder {
 			self.finish_picture(picture)?;
 		}
 
-		self.take_frames()
+		Ok(())
 	}
 
 	/// Returns every picture still held in the DPB, in output order, and resets
 	/// the decoder to await a new IDR.
 	pub fn flush(&mut self) -> anyhow::Result<Vec<Frame>> {
+		self.reset();
+		self.take_frames()
+	}
+
+	/// [`Decoder::flush`] for a caller taking its pictures on the GPU.
+	pub fn flush_exported(&mut self) -> anyhow::Result<Vec<ExportedFrame>> {
+		self.reset();
+		self.take_exported()
+	}
+
+	/// Moves the DPB to the ready queue and awaits a new IDR.
+	fn reset(&mut self) {
 		self.drain();
 		self.prev_ref_pic_info = PrevReferencePicInfo::default();
 		self.prev_pic_info = PrevPicInfo::default();
 		self.max_long_term_frame_idx = MaxLongTermFrameIdx::default();
-		self.take_frames()
 	}
 
 	/// Downloads every picture waiting in the ready queue.
 	fn take_frames(&mut self) -> anyhow::Result<Vec<Frame>> {
 		std::mem::take(&mut self.ready).iter().map(download).collect()
+	}
+
+	/// Exports every picture waiting in the ready queue, leaving the pixels
+	/// where the hardware wrote them.
+	fn take_exported(&mut self) -> anyhow::Result<Vec<ExportedFrame>> {
+		std::mem::take(&mut self.ready).iter().map(export).collect()
 	}
 
 	/// Moves everything left in the DPB to the ready queue.
@@ -969,6 +1049,7 @@ impl SurfacePool {
 		Ok(PooledSurface {
 			surface: Some(surface),
 			pool: Rc::clone(self),
+			retired: Cell::new(false),
 		})
 	}
 }
@@ -979,6 +1060,10 @@ struct PooledSurface {
 	/// move the surface back into the pool.
 	surface: Option<Surface<()>>,
 	pool: Rc<SurfacePool>,
+	/// Set once this surface's allocation has been handed out as a DRM PRIME
+	/// descriptor. Recycling it then would have the decoder draw its next
+	/// picture over pixels the consumer is still reading.
+	retired: Cell<bool>,
 }
 
 impl PooledSurface {
@@ -989,14 +1074,46 @@ impl PooledSurface {
 	fn id(&self) -> bindings::VASurfaceID {
 		self.get().id()
 	}
+
+	/// Keeps this surface out of the pool when the last handle to it drops.
+	fn retire(&self) {
+		self.retired.set(true);
+	}
 }
 
 impl Drop for PooledSurface {
 	fn drop(&mut self) {
 		if let Some(surface) = self.surface.take() {
-			self.pool.free.borrow_mut().push(surface);
+			// A retired surface is destroyed here, which releases libva's
+			// reference on the underlying buffer. The exported descriptor holds
+			// one of its own, so the pixels outlive this.
+			if !self.retired.get() {
+				self.pool.free.borrow_mut().push(surface);
+			}
 		}
 	}
+}
+
+/// Exports a decoded surface as a DRM PRIME descriptor, copying nothing.
+///
+/// The surface is retired from the pool on the way out: the descriptor refers to
+/// the same allocation, so recycling it would have a later picture overwrite one
+/// the caller still holds.
+fn export(handle: &Handle) -> anyhow::Result<ExportedFrame> {
+	let surface = handle.surface.get();
+	surface.sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
+
+	let descriptor = surface
+		.export_prime()
+		.map_err(|e| anyhow!("export the decode surface: {e:?}"))?;
+	handle.surface.retire();
+
+	Ok(ExportedFrame {
+		timestamp: handle.timestamp,
+		width: handle.width,
+		height: handle.height,
+		descriptor,
+	})
 }
 
 /// Reads a decoded surface back to client memory as tightly packed NV12.
@@ -1436,4 +1553,100 @@ fn build_slice_param(
 		chroma_weight_l1,
 		chroma_offset_l1,
 	)))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::os::fd::OwnedFd;
+
+	use super::*;
+
+	/// A gray field with a moving block, so a picture that decoded into the
+	/// wrong surface is visible as the block being in the wrong place.
+	fn nv12_frame(width: u32, height: u32, step: u32) -> Vec<u8> {
+		let (w, h) = (width as usize, height as usize);
+		let mut data = vec![128u8; w * h * 3 / 2];
+		let x0 = (step * 16) as usize % (w / 2);
+		for y in h / 4..h / 2 {
+			for x in x0..x0 + w / 4 {
+				data[y * w + x] = 235;
+			}
+		}
+		data
+	}
+
+	/// Decode to DRM PRIME descriptors and check the pictures never share an
+	/// allocation.
+	///
+	/// The invariant `export` exists to keep: an exported surface is retired
+	/// from the pool, because recycling it would have a later picture decoded
+	/// over pixels the caller still holds a descriptor for. Two pictures coming
+	/// back with the same modifier and layout is expected; two coming back on
+	/// the same allocation is the bug.
+	///
+	/// Skips without a VA-API device, so it is a no-op on a builder and real
+	/// coverage on a machine with a GPU. The exported modifier is hardware
+	/// policy, so it is printed rather than asserted.
+	#[test]
+	fn exported_pictures_do_not_share_a_surface() {
+		let (width, height) = (320u32, 240u32);
+		let Ok(mut encoder) = crate::encode::Encoder::new(crate::encode::Config::new(width, height, 30, 2_000_000, 30))
+		else {
+			eprintln!("skipping: no VA-API H.264 encoder");
+			return;
+		};
+		let Ok(mut decoder) = Decoder::new(Config::new()) else {
+			eprintln!("skipping: no VA-API H.264 decoder");
+			return;
+		};
+
+		let mut exported = Vec::new();
+		for step in 0..8 {
+			let unit = encoder
+				.encode_nv12(&nv12_frame(width, height, step), step == 0)
+				.expect("encode a picture");
+			exported.extend(decoder.decode_exported(&unit, step as u64).expect("decode a picture"));
+		}
+		exported.extend(decoder.flush_exported().expect("flush the decoder"));
+		assert!(!exported.is_empty(), "the decoder produced no pictures");
+
+		let first = &exported[0];
+		eprintln!(
+			"exported {} pictures: {}x{} fourcc {:#x} modifier {:#x}",
+			exported.len(),
+			first.width,
+			first.height,
+			first.descriptor.fourcc,
+			first.descriptor.objects[0].drm_format_modifier
+		);
+
+		let mut seen = Vec::new();
+		for (index, frame) in exported.iter().enumerate() {
+			assert_eq!((frame.width, frame.height), (width, height));
+			assert_eq!(frame.descriptor.fourcc, VA_FOURCC_NV12);
+			assert_eq!(frame.descriptor.objects.len(), 1, "a composed export is one object");
+			assert_eq!(frame.descriptor.layers[0].num_planes, 2, "NV12 is two planes");
+
+			// Two live descriptors for one allocation would mean the pool handed
+			// a retired surface back out. The inode behind a DMA-BUF names the
+			// buffer, and is what identifies one allocation from another.
+			let inode = inode(&frame.descriptor.objects[0].fd);
+			assert!(
+				!seen.contains(&inode),
+				"picture {index} was decoded into an allocation an earlier one still holds"
+			);
+			seen.push(inode);
+		}
+	}
+
+	/// The inode of a descriptor, which for a DMA-BUF names the allocation
+	/// behind it: every buffer gets its own on the anonymous dma-buf filesystem.
+	fn inode(fd: &OwnedFd) -> u64 {
+		use std::os::unix::fs::MetadataExt as _;
+
+		// Stat a duplicate, so the descriptor the caller holds is untouched and
+		// the `File` wrapper closes only its own copy.
+		let file = std::fs::File::from(fd.try_clone().expect("duplicate the descriptor"));
+		file.metadata().expect("stat the descriptor").ino()
+	}
 }
