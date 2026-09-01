@@ -30,6 +30,10 @@ pub mod bitstream_utils;
 pub mod codec;
 pub mod encode;
 
+// Written for this crate: the VA-API video post-processing entrypoint, used to
+// re-tile a surface into an allocation another API will accept.
+pub mod vpp;
+
 pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_1 as VADRMPRIMESurfaceDescriptorObject;
 pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_2 as VADRMPRIMESurfaceDescriptorLayer;
 pub use bindings::*;
