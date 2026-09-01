@@ -28,6 +28,7 @@ mod usage_hint;
 // bitstream layer (SPS/PPS/slice synthesis) plus a thin VA-API encode driver.
 pub mod bitstream_utils;
 pub mod codec;
+pub mod decode;
 pub mod encode;
 
 // Written for this crate: the VA-API video post-processing entrypoint, used to
