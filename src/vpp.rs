@@ -6,14 +6,21 @@
 //! freshly allocated surface. That is how a DMA-BUF carrying a format modifier
 //! some other API refuses to import becomes one it accepts.
 //!
-//! The case this was written for: the Intel iHD H.264 decoder writes
-//! `I915_FORMAT_MOD_Y_TILED` (`0x100000000000002`), and Mesa's Vulkan driver
-//! does not list that modifier for `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`, so
-//! `vkCreateImage` with an explicit modifier fails and the frame has to go
-//! through system memory instead. Blitting it into a VPP-allocated surface on
-//! the same device yields `I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS`
-//! (`0x100000000000009`), which Vulkan does list. The pixels never leave the
-//! GPU.
+//! The case this was written for was an importer that could only describe a
+//! single memory plane, which no 4:2:0 format satisfies: Mesa reports two memory
+//! planes for `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` under every modifier it
+//! lists, so the plane count was the obstacle rather than the tiling, and a
+//! re-tile could not have fixed it. An importer that takes one plane at a time
+//! needs none of this, since `R8_UNORM` and `R8G8_UNORM` are one memory plane
+//! each.
+//!
+//! What is left for it is a modifier the consumer does not list at all. The
+//! destination is a surface the driver allocates for itself, so the blit
+//! rewrites the pixels into whatever tiling that driver prefers for a fresh
+//! allocation, and the pixels never leave the GPU. Measured on Intel Meteor Lake
+//! with iHD, a decode target already exports at `0x100000000000009`
+//! (`I915_FORMAT_MOD_4_TILED`), which Mesa's Vulkan driver does list, so nothing
+//! on that hardware needs this today.
 //!
 //! [`Processor::retile`] is that path end to end: in an exported DMA-BUF, out a
 //! surface to export again. [`Processor::import`] and [`Processor::process`] are
