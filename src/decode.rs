@@ -1622,8 +1622,15 @@ fn build_slice_param(
 #[cfg(test)]
 mod tests {
 	use std::os::fd::OwnedFd;
+	use std::process::Command;
 
 	use super::*;
+
+	/// Encoder settings shared by the tests that need a stream rather than a
+	/// particular picture.
+	fn encoder_config(width: u32, height: u32) -> crate::encode::Config {
+		crate::encode::Config::new(width, height, 30, 2_000_000, 30)
+	}
 
 	/// A gray field with a moving block, so a picture that decoded into the
 	/// wrong surface is visible as the block being in the wrong place.
@@ -1654,8 +1661,7 @@ mod tests {
 	#[test]
 	fn exported_pictures_do_not_share_a_surface() {
 		let (width, height) = (320u32, 240u32);
-		let Ok(mut encoder) = crate::encode::Encoder::new(crate::encode::Config::new(width, height, 30, 2_000_000, 30))
-		else {
+		let Ok(mut encoder) = crate::encode::Encoder::new(encoder_config(width, height)) else {
 			eprintln!("skipping: no VA-API H.264 encoder");
 			return;
 		};
@@ -1717,8 +1723,7 @@ mod tests {
 		const PICTURES: u64 = 5;
 		let (width, height) = (320u32, 240u32);
 
-		let Ok(mut encoder) = crate::encode::Encoder::new(crate::encode::Config::new(width, height, 30, 2_000_000, 30))
-		else {
+		let Ok(mut encoder) = crate::encode::Encoder::new(encoder_config(width, height)) else {
 			eprintln!("skipping: no VA-API H.264 encoder");
 			return;
 		};
@@ -1780,8 +1785,7 @@ mod tests {
 	#[test]
 	fn an_exported_picture_downloads_to_the_same_pixels() {
 		let (width, height) = (320u32, 240u32);
-		let Ok(mut encoder) = crate::encode::Encoder::new(crate::encode::Config::new(width, height, 30, 2_000_000, 30))
-		else {
+		let Ok(mut encoder) = crate::encode::Encoder::new(encoder_config(width, height)) else {
 			eprintln!("skipping: no VA-API H.264 encoder");
 			return;
 		};
@@ -1819,6 +1823,200 @@ mod tests {
 				"picture {index} read back differently than it downloaded"
 			);
 		}
+	}
+
+	/// Decoded pictures match ffmpeg's software decoder byte for byte, in the
+	/// order both put them out.
+	///
+	/// The test that says this is a decoder rather than plumbing. The stream is
+	/// coded with B-frames and three reference frames, so matching the reference
+	/// means the reference lists, the picture order counts, and the DPB bumping
+	/// are all right, not just the surfaces. Skips without ffmpeg or a device.
+	#[test]
+	fn decoded_pictures_match_a_software_decoder() {
+		const WIDTH: u32 = 320;
+		const HEIGHT: u32 = 240;
+		const PICTURES: usize = 30;
+
+		let Some(stream) = ffmpeg(&[
+			"-f",
+			"lavfi",
+			"-i",
+			&format!("testsrc2=size={WIDTH}x{HEIGHT}:rate=30"),
+			"-frames:v",
+			&PICTURES.to_string(),
+			"-c:v",
+			"libx264",
+			"-profile:v",
+			"main",
+			"-bf",
+			"2",
+			"-refs",
+			"3",
+			"-g",
+			"15",
+			"-pix_fmt",
+			"yuv420p",
+			"-f",
+			"h264",
+			"-",
+		]) else {
+			eprintln!("skipping: no ffmpeg with libx264");
+			return;
+		};
+
+		// ffmpeg reads the elementary stream from a file rather than a pipe, so
+		// the test never has to drain its output while still writing its input.
+		let path = std::env::temp_dir().join(format!("moq-vaapi-decode-{}.264", std::process::id()));
+		std::fs::write(&path, &stream).expect("write the elementary stream");
+		let reference = ffmpeg(&[
+			"-i",
+			path.to_str().expect("a UTF-8 temporary path"),
+			"-pix_fmt",
+			"nv12",
+			"-f",
+			"rawvideo",
+			"-",
+		]);
+		let _ = std::fs::remove_file(&path);
+		let reference = reference.expect("ffmpeg decodes what it just encoded");
+
+		let picture_len = (WIDTH * HEIGHT * 3 / 2) as usize;
+		assert_eq!(
+			reference.len(),
+			PICTURES * picture_len,
+			"ffmpeg decoded a different count"
+		);
+
+		let Ok(mut decoder) = Decoder::new(Config::new()) else {
+			eprintln!("skipping: no VA-API H.264 decoder");
+			return;
+		};
+
+		let units = split_access_units(&stream);
+		let mut decoded = Vec::new();
+		for (index, unit) in units.iter().enumerate() {
+			decoded.extend(decoder.decode(unit, index as u64).expect("decode an access unit"));
+		}
+		decoded.extend(decoder.flush().expect("flush the decoder"));
+		assert_eq!(decoded.len(), PICTURES, "the decoder lost or invented pictures");
+
+		let mut timestamps: Vec<u64> = decoded.iter().map(|picture| picture.timestamp).collect();
+		assert!(
+			timestamps.windows(2).any(|pair| pair[0] > pair[1]),
+			"the stream came out in decode order, so nothing here tests reordering"
+		);
+		timestamps.sort_unstable();
+		assert_eq!(
+			timestamps,
+			(0..PICTURES as u64).collect::<Vec<_>>(),
+			"a picture's timestamp did not survive reordering"
+		);
+
+		for (index, picture) in decoded.iter().enumerate() {
+			assert_eq!((picture.width, picture.height), (WIDTH, HEIGHT));
+			assert!(
+				picture.data == reference[index * picture_len..][..picture_len],
+				"picture {index} of {PICTURES} differs from the software decoder"
+			);
+		}
+	}
+
+	/// A second sequence at another size decodes at that size, and the first
+	/// sequence's tail comes out ahead of it.
+	///
+	/// What `apply_sps` promises: an SPS that changes the coded size rebuilds the
+	/// VA context and the surface pool, and everything decoded against the old
+	/// one is let out first so no picture is read back at the wrong size.
+	#[test]
+	fn a_new_sequence_decodes_at_its_own_size() {
+		const PER_SEQUENCE: u32 = 6;
+		let sizes = [(320u32, 240u32), (192u32, 144u32)];
+
+		let Ok(mut decoder) = Decoder::new(Config::new()) else {
+			eprintln!("skipping: no VA-API H.264 decoder");
+			return;
+		};
+
+		let mut decoded = Vec::new();
+		let mut timestamp = 0u64;
+		for &(width, height) in &sizes {
+			let Ok(mut encoder) = crate::encode::Encoder::new(encoder_config(width, height)) else {
+				eprintln!("skipping: no VA-API H.264 encoder");
+				return;
+			};
+			for step in 0..PER_SEQUENCE {
+				let unit = encoder
+					.encode_nv12(&nv12_frame(width, height, step), step == 0)
+					.expect("encode a picture");
+				decoded.extend(decoder.decode(&unit, timestamp).expect("decode a picture"));
+				timestamp += 1;
+			}
+		}
+		decoded.extend(decoder.flush().expect("flush the decoder"));
+
+		let expected: Vec<(u32, u32)> = sizes
+			.iter()
+			.flat_map(|&size| std::iter::repeat_n(size, PER_SEQUENCE as usize))
+			.collect();
+		let actual: Vec<(u32, u32)> = decoded.iter().map(|picture| (picture.width, picture.height)).collect();
+		assert_eq!(actual, expected, "a picture came out at the wrong size or out of order");
+
+		let timestamps: Vec<u64> = decoded.iter().map(|picture| picture.timestamp).collect();
+		assert_eq!(timestamps, (0..timestamp).collect::<Vec<_>>());
+
+		for picture in &decoded {
+			let expected_len = (picture.width * picture.height * 3 / 2) as usize;
+			assert_eq!(
+				picture.data.len(),
+				expected_len,
+				"a picture was read back at the wrong size"
+			);
+		}
+	}
+
+	/// Runs ffmpeg with `args`, returning its standard output, or `None` when
+	/// ffmpeg is missing or refused the arguments.
+	fn ffmpeg(args: &[&str]) -> Option<Vec<u8>> {
+		let output = Command::new("ffmpeg").arg("-v").arg("error").args(args).output().ok()?;
+		if !output.status.success() {
+			eprintln!("ffmpeg {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+			return None;
+		}
+		Some(output.stdout)
+	}
+
+	/// Splits an Annex-B elementary stream into access units.
+	///
+	/// Each picture here is a single slice, so a unit ends at the next VCL NAL
+	/// unit, or at the next parameter set or SEI that follows one.
+	fn split_access_units(stream: &[u8]) -> Vec<Vec<u8>> {
+		let starts: Vec<usize> = (0..stream.len().saturating_sub(3))
+			.filter(|&i| stream[i..i + 3] == [0, 0, 1])
+			.collect();
+
+		let mut units = Vec::new();
+		let mut current: Vec<u8> = Vec::new();
+		let mut current_has_picture = false;
+
+		for (index, &start) in starts.iter().enumerate() {
+			let end = starts.get(index + 1).copied().unwrap_or(stream.len());
+			let nal_type = stream[start + 3] & 0x1f;
+			let is_slice = (1..=5).contains(&nal_type);
+
+			if current_has_picture && (is_slice || matches!(nal_type, 6..=9)) {
+				units.push(std::mem::take(&mut current));
+				current_has_picture = false;
+			}
+
+			current.extend_from_slice(&stream[start..end]);
+			current_has_picture |= is_slice;
+		}
+
+		if !current.is_empty() {
+			units.push(current);
+		}
+		units
 	}
 
 	/// The inode of a descriptor, which for a DMA-BUF names the allocation
