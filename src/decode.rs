@@ -252,10 +252,12 @@ impl Decoder {
 	fn submit(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<()> {
 		let mut cursor = Cursor::new(access_unit);
 		let mut current: Option<CurrentPicture> = None;
+		let mut nalus = 0usize;
 
 		// `Nalu::next` reports the end of the buffer as an error, so a truncated
 		// unit is indistinguishable from a complete one and simply stops us.
 		while let Ok(nalu) = Nalu::next(&mut cursor) {
+			nalus += 1;
 			match nalu.header.type_ {
 				NaluType::Sps => {
 					self.parser.parse_sps(&nalu).map_err(|e| anyhow!("parse SPS: {e}"))?;
@@ -291,6 +293,16 @@ impl Decoder {
 				}
 				other => log::trace!("ignoring NAL unit of type {other:?}"),
 			}
+		}
+
+		// Since the loop cannot tell a truncated unit from a complete one, a
+		// caller that hands us the wrong container gets silence. Say so once per
+		// unit rather than leaving them to wonder where their pictures went.
+		if nalus == 0 && !access_unit.is_empty() {
+			log::warn!(
+				"access unit of {} bytes holds no Annex-B NAL unit; length-prefixed input has to be converted first",
+				access_unit.len()
+			);
 		}
 
 		// Finishing here rather than on the next unit's first slice keeps the
@@ -420,6 +432,22 @@ impl Decoder {
 	/// Hands the driver one slice: its parameters, its reference lists, and the
 	/// slice NAL itself.
 	fn decode_slice(&mut self, current: &mut CurrentPicture, slice: &Slice) -> anyhow::Result<()> {
+		// A VA slice parameter carries both of these in 16 bits, so refuse what
+		// would otherwise be truncated into a plausible wrong offset. Only a
+		// picture past 65536 macroblocks, which is beyond 8K, gets close.
+		if slice.header.first_mb_in_slice > u32::from(u16::MAX) {
+			bail!(
+				"slice starts at macroblock {}, past what a VA slice parameter addresses",
+				slice.header.first_mb_in_slice
+			);
+		}
+		if slice.header.header_bit_size > usize::from(u16::MAX) {
+			bail!(
+				"slice header is {} bits long, past what a VA slice parameter addresses",
+				slice.header.header_bit_size
+			);
+		}
+
 		// A slice may refer to a different PPS than the one that started the
 		// picture, as long as it names the same SPS.
 		let pps = Rc::clone(
