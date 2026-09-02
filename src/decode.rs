@@ -95,9 +95,19 @@ pub struct Frame {
 ///
 /// The GPU counterpart of [`Frame`]: same picture, same timestamp, but a DRM
 /// PRIME descriptor for the surface rather than a copy of its pixels. The
-/// descriptor owns the exported file descriptors and keeps the allocation alive
-/// on its own, so the surface behind it is already gone by the time this is
-/// handed over.
+/// descriptor owns the exported file descriptors, and the surface it came from
+/// travels with it, so both the allocation and libva's handle on it outlive the
+/// decoder that produced them.
+///
+/// That surface is why [`ExportedFrame::download`] exists: a DRM PRIME
+/// descriptor keeps the memory alive but names nothing that can be mapped, and
+/// a decode target is tiled, so reading the file descriptor as rows would be
+/// wrong. Going back through the surface is the only correct way to the pixels,
+/// and it is the same `vaDeriveImage` path a downloaded [`Frame`] takes.
+///
+/// This is [`Send`] and [`Sync`] even though [`Decoder`] is neither: a surface
+/// is a display and an id, both of which libva serializes internally, and none
+/// of the decoder's `Rc`s come along.
 ///
 /// NV12, and one object holding both planes, which is what the Intel and AMD
 /// drivers export. Read the modifier off the object before assuming anything
@@ -114,6 +124,26 @@ pub struct ExportedFrame {
 	/// The surface's export: format, modifier, and the offset and pitch of each
 	/// plane.
 	pub descriptor: DrmPrimeSurfaceDescriptor,
+	/// The surface the picture was decoded into, retired from the decoder's pool
+	/// and held here so nothing draws over it and [`ExportedFrame::download`] has
+	/// something to map.
+	surface: Arc<Surface<()>>,
+}
+
+impl ExportedFrame {
+	/// Reads this picture back to client memory as tightly packed NV12.
+	///
+	/// The way back for a caller that took a descriptor and then found itself
+	/// with a consumer that wants bytes. It costs the read [`Decoder::decode`]
+	/// would have done up front, so prefer that decoder entry point when nothing
+	/// on the path draws on the GPU.
+	///
+	/// Same layout as [`Frame::data`]: `width * height` luma bytes followed by
+	/// `width * height / 2` interleaved chroma bytes, with the driver's row
+	/// padding dropped.
+	pub fn download(&self) -> anyhow::Result<Frame> {
+		read_back(&self.surface, self.timestamp, self.width, self.height)
+	}
 }
 
 impl std::fmt::Debug for ExportedFrame {
@@ -207,6 +237,10 @@ impl Decoder {
 	/// descriptor for. So this trades a surface allocation per picture for the
 	/// download, which is the right way round for anything that would only have
 	/// uploaded the pixels again.
+	///
+	/// A consumer that turns out to want bytes after all is not stuck: the
+	/// retired surface travels with the descriptor, and
+	/// [`ExportedFrame::download`] reads it back.
 	pub fn decode_exported(&mut self, access_unit: &[u8], timestamp: u64) -> anyhow::Result<Vec<ExportedFrame>> {
 		self.submit(access_unit, timestamp)?;
 		self.take_exported()
@@ -1026,26 +1060,27 @@ struct SurfacePool {
 	display: Arc<Display>,
 	width: u32,
 	height: u32,
-	free: RefCell<Vec<Surface<()>>>,
+	free: RefCell<Vec<Arc<Surface<()>>>>,
 }
 
 impl SurfacePool {
 	fn alloc(self: &Rc<Self>) -> anyhow::Result<PooledSurface> {
 		let surface = match self.free.borrow_mut().pop() {
 			Some(surface) => surface,
-			None => self
-				.display
-				.create_surfaces::<()>(
-					VA_RT_FORMAT_YUV420,
-					Some(VA_FOURCC_NV12),
-					self.width,
-					self.height,
-					Some(UsageHint::USAGE_HINT_DECODER),
-					vec![()],
-				)
-				.map_err(|e| anyhow!("create decode surface: {e:?}"))?
-				.pop()
-				.context("VA-API returned an empty surface list")?,
+			None => Arc::new(
+				self.display
+					.create_surfaces::<()>(
+						VA_RT_FORMAT_YUV420,
+						Some(VA_FOURCC_NV12),
+						self.width,
+						self.height,
+						Some(UsageHint::USAGE_HINT_DECODER),
+						vec![()],
+					)
+					.map_err(|e| anyhow!("create decode surface: {e:?}"))?
+					.pop()
+					.context("VA-API returned an empty surface list")?,
+			),
 		};
 
 		Ok(PooledSurface {
@@ -1057,10 +1092,13 @@ impl SurfacePool {
 }
 
 /// A surface on loan from a [`SurfacePool`], returned to it on drop.
+///
+/// The surface sits behind an [`Arc`] so that an export can hold one of its own:
+/// see [`PooledSurface::retain`].
 struct PooledSurface {
 	/// Always `Some` until dropped; the `Option` is only there so [`Drop`] can
 	/// move the surface back into the pool.
-	surface: Option<Surface<()>>,
+	surface: Option<Arc<Surface<()>>>,
 	pool: Rc<SurfacePool>,
 	/// Set once this surface's allocation has been handed out as a DRM PRIME
 	/// descriptor. Recycling it then would have the decoder draw its next
@@ -1069,7 +1107,7 @@ struct PooledSurface {
 }
 
 impl PooledSurface {
-	fn get(&self) -> &Surface<()> {
+	fn get(&self) -> &Arc<Surface<()>> {
 		self.surface.as_ref().expect("surface is taken only on drop")
 	}
 
@@ -1077,18 +1115,27 @@ impl PooledSurface {
 		self.get().id()
 	}
 
-	/// Keeps this surface out of the pool when the last handle to it drops.
-	fn retire(&self) {
+	/// Retires this surface from the pool and hands out a reference to it.
+	///
+	/// Retiring is what keeps the pixels still: a recycled allocation would have
+	/// the decoder draw its next picture over the one whose descriptor the caller
+	/// holds. Handing the surface out alongside that descriptor is what lets the
+	/// caller still read the picture back with `vaDeriveImage`, since the
+	/// exported file descriptor keeps the memory alive but names no surface to
+	/// map.
+	fn retain(&self) -> Arc<Surface<()>> {
 		self.retired.set(true);
+		Arc::clone(self.get())
 	}
 }
 
 impl Drop for PooledSurface {
 	fn drop(&mut self) {
 		if let Some(surface) = self.surface.take() {
-			// A retired surface is destroyed here, which releases libva's
-			// reference on the underlying buffer. The exported descriptor holds
-			// one of its own, so the pixels outlive this.
+			// A retired surface is not recycled. Its `Arc` is held by whatever
+			// [`PooledSurface::retain`] handed it to, so libva keeps its
+			// reference on the allocation until that drops too; an unretired one
+			// has a reference count of one and goes back to the pool.
 			if !self.retired.get() {
 				self.pool.free.borrow_mut().push(surface);
 			}
@@ -1100,7 +1147,8 @@ impl Drop for PooledSurface {
 ///
 /// The surface is retired from the pool on the way out: the descriptor refers to
 /// the same allocation, so recycling it would have a later picture overwrite one
-/// the caller still holds.
+/// the caller still holds. It travels with the descriptor rather than being
+/// destroyed, so [`ExportedFrame::download`] can still map it.
 fn export(handle: &Handle) -> anyhow::Result<ExportedFrame> {
 	let surface = handle.surface.get();
 	surface.sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
@@ -1108,29 +1156,39 @@ fn export(handle: &Handle) -> anyhow::Result<ExportedFrame> {
 	let descriptor = surface
 		.export_prime()
 		.map_err(|e| anyhow!("export the decode surface: {e:?}"))?;
-	handle.surface.retire();
 
 	Ok(ExportedFrame {
 		timestamp: handle.timestamp,
 		width: handle.width,
 		height: handle.height,
 		descriptor,
+		surface: handle.surface.retain(),
 	})
 }
 
 /// Reads a decoded surface back to client memory as tightly packed NV12.
 fn download(handle: &Handle) -> anyhow::Result<Frame> {
-	let surface = handle.surface.get();
+	read_back(handle.surface.get(), handle.timestamp, handle.width, handle.height)
+}
+
+/// Reads `surface` back to client memory as tightly packed NV12, cropped to
+/// `width` by `height`.
+///
+/// The one read-back path, shared by the picture a decoder downloads itself and
+/// the one a caller took as a descriptor and later wants on the CPU after all.
+fn read_back(surface: &Surface<()>, timestamp: u64, width: u32, height: u32) -> anyhow::Result<Frame> {
 	surface.sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
 
-	let visible = (handle.width, handle.height);
+	let visible = (width, height);
 
 	// vaDeriveImage exposes the surface's own buffer, so the copy below is the
 	// only one. Not every driver can derive every surface; fall back to
 	// vaCreateImage + vaGetImage, which always works but copies inside the driver
 	// first.
 	match Image::derive_from(surface, visible) {
-		Ok(image) if image.image().format.fourcc == VA_FOURCC_NV12 => return pack_nv12(&image, handle),
+		Ok(image) if image.image().format.fourcc == VA_FOURCC_NV12 => {
+			return pack_nv12(&image, timestamp, width, height);
+		}
 		Ok(_) => log::debug!("derived image is not NV12, falling back to vaGetImage"),
 		Err(e) => log::debug!("vaDeriveImage failed ({e:?}), falling back to vaGetImage"),
 	}
@@ -1145,15 +1203,15 @@ fn download(handle: &Handle) -> anyhow::Result<Frame> {
 	let image = Image::create_from(surface, format, surface.size(), visible)
 		.map_err(|e| anyhow!("vaGetImage into an NV12 image: {e:?}"))?;
 
-	pack_nv12(&image, handle)
+	pack_nv12(&image, timestamp, width, height)
 }
 
 /// Copies a mapped NV12 image into a tightly packed buffer, dropping the row
 /// padding the driver's pitch may carry.
-fn pack_nv12(image: &Image<'_>, handle: &Handle) -> anyhow::Result<Frame> {
+fn pack_nv12(image: &Image<'_>, timestamp: u64, frame_width: u32, frame_height: u32) -> anyhow::Result<Frame> {
 	let va_image = image.image();
 	let src: &[u8] = image.as_ref();
-	let (width, height) = (handle.width as usize, handle.height as usize);
+	let (width, height) = (frame_width as usize, frame_height as usize);
 	let chroma_rows = height / 2;
 
 	let mut data = vec![0u8; width * (height + chroma_rows)];
@@ -1176,9 +1234,9 @@ fn pack_nv12(image: &Image<'_>, handle: &Handle) -> anyhow::Result<Frame> {
 	)?;
 
 	Ok(Frame {
-		timestamp: handle.timestamp,
-		width: handle.width,
-		height: handle.height,
+		timestamp,
+		width: frame_width,
+		height: frame_height,
 		data,
 	})
 }
@@ -1692,6 +1750,71 @@ mod tests {
 		// The bumping process marks what it hands out, so a second flush finds
 		// nothing and a caller that flushes twice never sees a picture twice.
 		assert!(decoder.flush().expect("flush an empty decoder").is_empty());
+	}
+
+	/// An exported picture crosses threads, which is the whole point of handing
+	/// one to a renderer: the decoder runs on its own thread and the frame
+	/// outlives it. [`Decoder`] itself is neither, so this is what says the
+	/// export sheds that.
+	#[test]
+	fn an_exported_frame_is_send_and_sync() {
+		const fn assert_send_sync<T: Send + Sync>() {}
+		assert_send_sync::<ExportedFrame>();
+	}
+
+	/// An exported picture reads back to the same pixels the ordinary path
+	/// downloads.
+	///
+	/// The invariant that lets a GPU-resident frame keep a CPU fallback: the
+	/// surface is retained rather than destroyed, so `vaDeriveImage` still
+	/// reaches the picture the descriptor points at. Two decoders on one stream,
+	/// so both sides see the same pictures in the same order and the comparison
+	/// is exact rather than approximate.
+	///
+	/// Skips without a VA-API device, so it is a no-op on a builder and real
+	/// coverage on a machine with a GPU.
+	#[test]
+	fn an_exported_picture_downloads_to_the_same_pixels() {
+		let (width, height) = (320u32, 240u32);
+		let Ok(mut encoder) = crate::encode::Encoder::new(crate::encode::Config::new(width, height, 30, 2_000_000, 30))
+		else {
+			eprintln!("skipping: no VA-API H.264 encoder");
+			return;
+		};
+		let Ok(mut exporting) = Decoder::new(Config::new()) else {
+			eprintln!("skipping: no VA-API H.264 decoder");
+			return;
+		};
+		let mut downloading = Decoder::new(Config::new()).expect("a second decoder");
+
+		let mut exported = Vec::new();
+		let mut downloaded = Vec::new();
+		for step in 0..8 {
+			let unit = encoder
+				.encode_nv12(&nv12_frame(width, height, step), step == 0)
+				.expect("encode a picture");
+			exported.extend(
+				exporting
+					.decode_exported(&unit, step as u64)
+					.expect("decode to a descriptor"),
+			);
+			downloaded.extend(downloading.decode(&unit, step as u64).expect("decode to client memory"));
+		}
+		exported.extend(exporting.flush_exported().expect("flush the exporting decoder"));
+		downloaded.extend(downloading.flush().expect("flush the downloading decoder"));
+
+		assert!(!exported.is_empty(), "the decoder produced no pictures");
+		assert_eq!(exported.len(), downloaded.len(), "the two decoders disagreed");
+
+		for (index, (gpu, cpu)) in exported.iter().zip(&downloaded).enumerate() {
+			let read_back = gpu.download().expect("read the exported surface back");
+			assert_eq!(read_back.timestamp, cpu.timestamp, "picture {index} lost its timestamp");
+			assert_eq!((read_back.width, read_back.height), (cpu.width, cpu.height));
+			assert!(
+				read_back.data == cpu.data,
+				"picture {index} read back differently than it downloaded"
+			);
+		}
 	}
 
 	/// The inode of a descriptor, which for a DMA-BUF names the allocation
