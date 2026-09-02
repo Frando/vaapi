@@ -15,17 +15,17 @@
 //! framework. The per-picture and per-slice VA buffer population is ported from
 //! cros-codecs's `decoder/stateless/h264/vaapi.rs`.
 //!
-//! Feed [`Decoder::decode`] one Annex-B access unit at a time. The picture it
-//! carries is submitted and completed before the call returns, rather than when
-//! the next unit's first slice arrives, so the hardware is never left holding a
-//! half-submitted picture between calls. Output still trails, and by more than
-//! the stream's reorder depth: C.4.5.3 bumps the DPB only when a new picture
-//! needs the slot, so the delay follows the sequence's reference and reorder
-//! limits instead. A stream coded with three reference frames trails by three
-//! pictures whether or not it uses B-frames. [`Frame`] therefore carries the
-//! timestamp of the access unit it was coded in rather than the one last pushed,
-//! and [`Decoder::flush`] releases what is left at the end of a stream, which is
-//! the whole tail rather than a single picture.
+//! Feed [`Decoder::decode`] one Annex-B access unit at a time. Its picture is
+//! submitted and completed before the call returns, rather than when the next
+//! unit's first slice arrives, so the hardware is never left holding a
+//! half-submitted picture between calls.
+//!
+//! Output trails input, and by more than the stream's reorder depth: C.4.5.3
+//! bumps the DPB only when a new picture needs the slot, so the delay follows
+//! the sequence's reference and reorder limits. A stream coded with three
+//! reference frames trails by three pictures whether or not it uses B-frames.
+//! [`Frame`] therefore carries the timestamp of the access unit it was coded in,
+//! and [`Decoder::flush`] is what releases the tail at the end of a stream.
 //!
 //! Progressive 8-bit 4:2:0 only: a sequence that is interlaced, deeper than 8
 //! bits, or not 4:2:0 is rejected rather than decoded wrongly. That covers every
@@ -95,24 +95,19 @@ pub struct Frame {
 ///
 /// The GPU counterpart of [`Frame`]: same picture, same timestamp, but a DRM
 /// PRIME descriptor for the surface rather than a copy of its pixels. The
-/// descriptor owns the exported file descriptors, and the surface it came from
-/// travels with it, so both the allocation and libva's handle on it outlive the
-/// decoder that produced them.
+/// descriptor owns the exported file descriptors and the surface travels with
+/// it, so both the allocation and libva's handle on it outlive the decoder.
 ///
-/// That surface is why [`ExportedFrame::download`] exists: a DRM PRIME
-/// descriptor keeps the memory alive but names nothing that can be mapped, and
-/// a decode target is tiled, so reading the file descriptor as rows would be
-/// wrong. Going back through the surface is the only correct way to the pixels,
-/// and it is the same `vaDeriveImage` path a downloaded [`Frame`] takes.
+/// The export is NV12 in one object holding both planes, which is what the
+/// Intel and AMD drivers produce. Read the modifier off the object before
+/// assuming anything about the layout: a decode target is tiled, and the plane
+/// pitches carry padding the visible size does not imply. That is also why
+/// [`ExportedFrame::download`] goes back through the surface instead of reading
+/// the file descriptor as rows.
 ///
 /// This is [`Send`] and [`Sync`] even though [`Decoder`] is neither: a surface
 /// is a display and an id, both of which libva serializes internally, and none
 /// of the decoder's `Rc`s come along.
-///
-/// NV12, and one object holding both planes, which is what the Intel and AMD
-/// drivers export. Read the modifier off the object before assuming anything
-/// about the layout: a decode target is tiled, and the plane pitches carry
-/// padding the visible size does not imply.
 pub struct ExportedFrame {
 	/// Timestamp of the access unit this picture was coded in, as handed to
 	/// [`Decoder::decode_exported`].
@@ -135,12 +130,10 @@ impl ExportedFrame {
 	///
 	/// The way back for a caller that took a descriptor and then found itself
 	/// with a consumer that wants bytes. It costs the read [`Decoder::decode`]
-	/// would have done up front, so prefer that decoder entry point when nothing
-	/// on the path draws on the GPU.
+	/// would have done up front, so prefer that entry point when nothing on the
+	/// path draws on the GPU.
 	///
-	/// Same layout as [`Frame::data`]: `width * height` luma bytes followed by
-	/// `width * height / 2` interleaved chroma bytes, with the driver's row
-	/// padding dropped.
+	/// Same layout as [`Frame::data`], with the driver's row padding dropped.
 	pub fn download(&self) -> anyhow::Result<Frame> {
 		read_back(&self.surface, self.timestamp, self.width, self.height)
 	}
@@ -169,6 +162,26 @@ impl std::fmt::Debug for Frame {
 }
 
 /// A VA-API H.264 decoder. Built once, fed Annex-B access units, emits NV12.
+///
+/// # Examples
+///
+/// ```no_run
+/// use moq_vaapi::decode::{Config, Decoder};
+///
+/// # fn main() -> anyhow::Result<()> {
+/// # let access_units: Vec<Vec<u8>> = Vec::new();
+/// let mut decoder = Decoder::new(Config::new())?;
+/// let mut pictures = Vec::new();
+///
+/// for (index, access_unit) in access_units.iter().enumerate() {
+///     pictures.extend(decoder.decode(access_unit, index as u64)?);
+/// }
+///
+/// // Output trails input, so the tail of the stream only arrives here.
+/// pictures.extend(decoder.flush()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Decoder {
 	parser: Parser,
 	dpb: Dpb<Handle>,
@@ -314,8 +327,15 @@ impl Decoder {
 		Ok(())
 	}
 
-	/// Returns every picture still held in the DPB, in output order, and resets
-	/// the decoder to await a new IDR.
+	/// Returns every picture still held in the DPB, in output order.
+	///
+	/// C.4.5.3 bumps the DPB only when a new picture needs the slot, so a stream
+	/// that simply stops leaves its tail sitting there. This releases that tail
+	/// and empties the DPB, so a second call returns nothing.
+	///
+	/// The parsed parameter sets survive, and nothing here waits for an IDR: a
+	/// stream picked up part way through decodes against an empty DPB, which
+	/// gives distorted pictures until its next IDR rather than an error.
 	pub fn flush(&mut self) -> anyhow::Result<Vec<Frame>> {
 		self.reset();
 		self.take_frames()
@@ -327,7 +347,8 @@ impl Decoder {
 		self.take_exported()
 	}
 
-	/// Moves the DPB to the ready queue and awaits a new IDR.
+	/// Moves the DPB to the ready queue and forgets the order count state the
+	/// next picture would otherwise be derived against.
 	fn reset(&mut self) {
 		self.drain();
 		self.prev_ref_pic_info = PrevReferencePicInfo::default();
@@ -1674,18 +1695,14 @@ mod tests {
 		data
 	}
 
-	/// Decode to DRM PRIME descriptors and check the pictures never share an
-	/// allocation.
+	/// Exported pictures never share a surface.
 	///
 	/// The invariant `export` exists to keep: an exported surface is retired
 	/// from the pool, because recycling it would have a later picture decoded
 	/// over pixels the caller still holds a descriptor for. Two pictures coming
 	/// back with the same modifier and layout is expected; two coming back on
-	/// the same allocation is the bug.
-	///
-	/// Skips without a VA-API device, so it is a no-op on a builder and real
-	/// coverage on a machine with a GPU. The exported modifier is hardware
-	/// policy, so it is printed rather than asserted.
+	/// the same allocation is the bug. The modifier itself is hardware policy,
+	/// so it is printed rather than asserted.
 	#[test]
 	fn exported_pictures_do_not_share_a_surface() {
 		let (width, height) = (320u32, 240u32);
@@ -1737,15 +1754,13 @@ mod tests {
 		}
 	}
 
-	/// Every picture fed in comes back out, but only once the decoder is flushed.
+	/// Every picture fed in comes back out, the last of them only on flush.
 	///
-	/// The contract [`Decoder::flush`] exists for. C.4.5.3 bumps the DPB when a
-	/// new picture needs a slot, so a stream that simply stops leaves its tail
-	/// sitting there: as many pictures as the sequence's reference and reorder
-	/// limits allow, which is one for this crate's IPPP encoder and three for a
-	/// stream coded the way x264 does by default. The `decode` half of the
-	/// assertion keeps this honest, since a decoder that held nothing back would
-	/// satisfy the rest without a flush ever running.
+	/// C.4.5.3 bumps the DPB when a new picture needs a slot, so a stream that
+	/// simply stops leaves its tail sitting there: one picture for this crate's
+	/// IPPP encoder, three for a stream coded the way x264 does by default. The
+	/// first assertion keeps the test honest, since a decoder that held nothing
+	/// back would satisfy the rest without a flush ever running.
 	#[test]
 	fn flush_returns_the_pictures_the_dpb_still_holds() {
 		const PICTURES: u64 = 5;
@@ -1789,10 +1804,10 @@ mod tests {
 		assert!(decoder.flush().expect("flush an empty decoder").is_empty());
 	}
 
-	/// An exported picture crosses threads, which is the whole point of handing
-	/// one to a renderer: the decoder runs on its own thread and the frame
-	/// outlives it. [`Decoder`] itself is neither, so this is what says the
-	/// export sheds that.
+	/// An exported picture crosses threads, which is the point of handing one to
+	/// a renderer: the decoder runs on its own thread and the frame outlives it.
+	/// [`Decoder`] is neither [`Send`] nor [`Sync`], so this pins that the export
+	/// does not inherit that.
 	#[test]
 	fn an_exported_frame_is_send_and_sync() {
 		const fn assert_send_sync<T: Send + Sync>() {}
@@ -1804,12 +1819,9 @@ mod tests {
 	///
 	/// The invariant that lets a GPU-resident frame keep a CPU fallback: the
 	/// surface is retained rather than destroyed, so `vaDeriveImage` still
-	/// reaches the picture the descriptor points at. Two decoders on one stream,
-	/// so both sides see the same pictures in the same order and the comparison
-	/// is exact rather than approximate.
-	///
-	/// Skips without a VA-API device, so it is a no-op on a builder and real
-	/// coverage on a machine with a GPU.
+	/// reaches the picture the descriptor points at. One stream through two
+	/// decoders, so both sides see the same pictures in the same order and the
+	/// comparison is exact rather than approximate.
 	#[test]
 	fn an_exported_picture_downloads_to_the_same_pixels() {
 		let (width, height) = (320u32, 240u32);

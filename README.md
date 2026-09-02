@@ -28,7 +28,8 @@ pulled in as a git dependency.
   reordering, frame_num gaps), and mid-stream resolution changes. Progressive
   8-bit 4:2:0 only. Verified bit-exact against ffmpeg's software decoder on Intel
   Meteor Lake (iHD 26.1.5) for constrained baseline, main with B-frames, high at
-  720p, and a cropped non-macroblock-aligned size.
+  720p, and a cropped non-macroblock-aligned size. The main-with-B-frames case
+  runs as a test wherever ffmpeg and a VA-API device are both present.
 - **Pinned, vendored headers.** libva's headers are vendored into
   [`libva/`](./libva) (see `just vendor`) and fed to bindgen, so generating the
   bindings needs **no system libva-dev** — only `libclang` — and the pinned
