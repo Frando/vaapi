@@ -18,12 +18,14 @@
 //! Feed [`Decoder::decode`] one Annex-B access unit at a time. The picture it
 //! carries is submitted and completed before the call returns, rather than when
 //! the next unit's first slice arrives, so the hardware is never left holding a
-//! half-submitted picture between calls. Output still trails: C.4.5.3 bumps the
-//! DPB only when a new picture needs the slot, so a stream without reordering
-//! hands each picture back on the following call, and one that does reorder holds
-//! them longer. [`Frame`] therefore carries the timestamp of the access unit it
-//! was coded in rather than the one last pushed, and [`Decoder::flush`] releases
-//! what is left at the end of a stream.
+//! half-submitted picture between calls. Output still trails, and by more than
+//! the stream's reorder depth: C.4.5.3 bumps the DPB only when a new picture
+//! needs the slot, so the delay follows the sequence's reference and reorder
+//! limits instead. A stream coded with three reference frames trails by three
+//! pictures whether or not it uses B-frames. [`Frame`] therefore carries the
+//! timestamp of the access unit it was coded in rather than the one last pushed,
+//! and [`Decoder::flush`] releases what is left at the end of a stream, which is
+//! the whole tail rather than a single picture.
 //!
 //! Progressive 8-bit 4:2:0 only: a sequence that is interlaced, deeper than 8
 //! bits, or not 4:2:0 is rejected rather than decoded wrongly. That covers every
@@ -1637,6 +1639,59 @@ mod tests {
 			);
 			seen.push(inode);
 		}
+	}
+
+	/// Every picture fed in comes back out, but only once the decoder is flushed.
+	///
+	/// The contract [`Decoder::flush`] exists for. C.4.5.3 bumps the DPB when a
+	/// new picture needs a slot, so a stream that simply stops leaves its tail
+	/// sitting there: as many pictures as the sequence's reference and reorder
+	/// limits allow, which is one for this crate's IPPP encoder and three for a
+	/// stream coded the way x264 does by default. The `decode` half of the
+	/// assertion keeps this honest, since a decoder that held nothing back would
+	/// satisfy the rest without a flush ever running.
+	#[test]
+	fn flush_returns_the_pictures_the_dpb_still_holds() {
+		const PICTURES: u64 = 5;
+		let (width, height) = (320u32, 240u32);
+
+		let Ok(mut encoder) = crate::encode::Encoder::new(crate::encode::Config::new(width, height, 30, 2_000_000, 30))
+		else {
+			eprintln!("skipping: no VA-API H.264 encoder");
+			return;
+		};
+		let Ok(mut decoder) = Decoder::new(Config::new()) else {
+			eprintln!("skipping: no VA-API H.264 decoder");
+			return;
+		};
+
+		let mut streamed = Vec::new();
+		for step in 0..PICTURES {
+			let unit = encoder
+				.encode_nv12(&nv12_frame(width, height, step as u32), step == 0)
+				.expect("encode a picture");
+			streamed.extend(decoder.decode(&unit, step).expect("decode a picture"));
+		}
+		assert!(
+			(streamed.len() as u64) < PICTURES,
+			"the DPB held nothing back, so this test proves nothing"
+		);
+
+		let flushed = decoder.flush().expect("flush the decoder");
+		let timestamps: Vec<u64> = streamed
+			.iter()
+			.chain(&flushed)
+			.map(|picture| picture.timestamp)
+			.collect();
+		assert_eq!(
+			timestamps,
+			(0..PICTURES).collect::<Vec<_>>(),
+			"the stream lost pictures at its end"
+		);
+
+		// The bumping process marks what it hands out, so a second flush finds
+		// nothing and a caller that flushes twice never sees a picture twice.
+		assert!(decoder.flush().expect("flush an empty decoder").is_empty());
 	}
 
 	/// The inode of a descriptor, which for a DMA-BUF names the allocation
