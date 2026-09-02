@@ -569,7 +569,7 @@ impl Decoder {
 
 				let max_pic_order_cnt_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
 
-				pic.pic_order_cnt_msb = if (pic.pic_order_cnt_lsb < self.prev_ref_pic_info.pic_order_cnt_lsb)
+				pic.pic_order_cnt_msb = if (pic.pic_order_cnt_lsb < prev_pic_order_cnt_lsb)
 					&& (prev_pic_order_cnt_lsb - pic.pic_order_cnt_lsb >= max_pic_order_cnt_lsb / 2)
 				{
 					prev_pic_order_cnt_msb + max_pic_order_cnt_lsb
@@ -625,11 +625,15 @@ impl Decoder {
 						bail!("invalid num_ref_frames_in_pic_order_cnt_cycle");
 					}
 
-					let cycles = (abs_frame_num - 1) / u32::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
+					let cycle_len = u32::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
+					let cycles = (abs_frame_num - 1) / cycle_len;
+					// The cycle is only summed up to the position this frame sits
+					// at within it, not all the way round.
+					let position_in_cycle = (abs_frame_num - 1) % cycle_len;
 					expected_pic_order_cnt = cycles as i32 * sps.expected_delta_per_pic_order_cnt_cycle;
 
-					for i in 0..sps.num_ref_frames_in_pic_order_cnt_cycle {
-						expected_pic_order_cnt += sps.offset_for_ref_frame[usize::from(i)];
+					for i in 0..=position_in_cycle {
+						expected_pic_order_cnt += sps.offset_for_ref_frame[i as usize];
 					}
 				}
 
