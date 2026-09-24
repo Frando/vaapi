@@ -31,10 +31,18 @@ pub mod codec;
 pub mod decode;
 pub mod encode;
 
+// Written for this crate: DMA-BUF import, the color space an encoder labels its
+// stream with, and the VA-API video post-processing entrypoint, which scales,
+// converts, and re-tiles surfaces on the GPU.
+pub mod color;
+pub mod dmabuf;
+pub mod vpp;
+
 pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_1 as VADRMPRIMESurfaceDescriptorObject;
 pub use bindings::_VADRMPRIMESurfaceDescriptor__bindgen_ty_2 as VADRMPRIMESurfaceDescriptorLayer;
 pub use bindings::*;
 pub use buffer::*;
+pub use color::{Color, Matrix};
 pub use config::*;
 pub use context::*;
 pub use display::*;
