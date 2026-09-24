@@ -1161,6 +1161,29 @@ impl SpsBuilder {
 		self
 	}
 
+	/// Labels the stream's color space in the VUI.
+	///
+	/// `video_format` goes out as 5 (unspecified), the value a decoder infers
+	/// when the field is absent, so this only adds the range and the color
+	/// description.
+	pub fn video_signal_type(
+		mut self,
+		full_range: bool,
+		colour_primaries: u8,
+		transfer_characteristics: u8,
+		matrix_coefficients: u8,
+	) -> Self {
+		self = self.vui_parameters_present();
+		self.0.vui_parameters.video_signal_type_present_flag = true;
+		self.0.vui_parameters.video_format = 5;
+		self.0.vui_parameters.video_full_range_flag = full_range;
+		self.0.vui_parameters.colour_description_present_flag = true;
+		self.0.vui_parameters.colour_primaries = colour_primaries;
+		self.0.vui_parameters.transfer_characteristics = transfer_characteristics;
+		self.0.vui_parameters.matrix_coefficients = matrix_coefficients;
+		self
+	}
+
 	pub fn bitstream_restrictions_present(mut self) -> Self {
 		if self.0.vui_parameters.bitstream_restriction_flag {
 			return self;
