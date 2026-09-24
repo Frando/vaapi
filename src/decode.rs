@@ -59,15 +59,15 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct Config {
 	/// DRM render node to open (e.g. `/dev/dri/renderD128`).
-	pub device: PathBuf,
+	///
+	/// `None`, the default, opens the first node whose driver can decode H.264.
+	pub device: Option<PathBuf>,
 }
 
 impl Config {
-	/// Returns a configuration pointing at the default render node.
+	/// Returns a configuration that opens the first render node whose driver can decode H.264.
 	pub fn new() -> Self {
-		Self {
-			device: PathBuf::from("/dev/dri/renderD128"),
-		}
+		Self { device: None }
 	}
 }
 
@@ -230,19 +230,28 @@ pub struct Decoder {
 }
 
 impl Decoder {
-	/// Opens the render node and checks that the driver exposes an H.264 decode
-	/// entrypoint.
+	/// Opens [`Config::device`], or the first render node that decodes H.264,
+	/// and checks that the driver exposes an H.264 decode entrypoint.
 	///
 	/// The VA config, context, and surface pool are built later, from the first
 	/// SPS, since their profile and size come from the stream. This still fails
 	/// early enough for a caller to fall back to another decoder when libva is
-	/// missing, the node cannot be opened, or the driver decodes no H.264.
+	/// missing, the node cannot be opened, or the driver decodes no H.264. A
+	/// named node is never swapped for another.
 	pub fn new(config: Config) -> anyhow::Result<Self> {
-		let display = Display::open_drm_display(&config.device)
-			.map_err(|e| anyhow!("open DRM display {:?}: {e:?}", config.device))?;
-		probe_decode_entrypoint(&display)?;
+		let (device, display) = match config.device {
+			Some(device) => {
+				let display =
+					Display::open_drm_display(&device).map_err(|e| anyhow!("open DRM display {device:?}: {e:?}"))?;
+				probe(&display)?;
+				(device, display)
+			}
+			None => {
+				crate::display::open_first(probe).map_err(|e| e.context("find a render node that decodes H.264"))?
+			}
+		};
 
-		log::info!("opened VA-API H.264 decoder on {:?}", config.device);
+		log::info!("opened VA-API H.264 decoder on {device:?}");
 		Ok(Self {
 			parser: Parser::default(),
 			dpb: Dpb::default(),
@@ -1366,8 +1375,13 @@ fn copy_plane(
 	Ok(())
 }
 
-/// Fails unless the driver can decode H.264 at some profile we can drive.
-fn probe_decode_entrypoint(display: &Display) -> anyhow::Result<()> {
+/// Checks that `display`'s driver can decode H.264, which is what [`Decoder::new`] needs of a render node.
+///
+/// # Errors
+///
+/// Fails unless the driver offers `VAEntrypointVLD` for a Constrained
+/// Baseline, Main, or High profile, or when it cannot be asked.
+pub fn probe(display: &Display) -> anyhow::Result<()> {
 	let profiles = display
 		.query_config_profiles()
 		.map_err(|e| anyhow!("query VA profiles: {e:?}"))?;
@@ -1879,6 +1893,23 @@ mod tests {
 			);
 			seen.push(inode);
 		}
+	}
+
+	/// With no node named, the decoder opens one that decodes H.264. A named
+	/// node is used or refused, never swapped for another.
+	#[test]
+	fn the_render_node_is_found_or_named() {
+		if let Err(err) = Decoder::new(Config::new()) {
+			eprintln!("skipping: no VA-API H.264 decoder: {err:#}");
+			return;
+		}
+		let named = Config {
+			device: Some(PathBuf::from("/dev/null")),
+		};
+		assert!(
+			Decoder::new(named).is_err(),
+			"a named node that is not a render node was swapped for one that is"
+		);
 	}
 
 	/// Every picture fed in comes back out, the last of them only on flush.
