@@ -2,10 +2,9 @@
 
 > **⚠️ AI GENERATED.** This crate was written by an AI agent (Claude), using the
 > repositories below as references. How closely individual files track upstream
-> varies and the encoder's emitted bitstream has not been validated at playback —
-> treat the whole thing as derived, unverified work and review before relying on
-> it. The decoder is the exception: it has been checked against a software
-> reference on Intel hardware (see below).
+> varies, so treat the whole thing as derived work and review before relying on
+> it. The encoder and the decoder have both been checked against ffmpeg's
+> software codecs on Intel hardware (see below).
 
 A small, self-contained **VA-API H.264 hardware codec** for Linux (Intel / AMD),
 derived from
@@ -21,8 +20,22 @@ pulled in as a git dependency.
 
 ## What it does
 
-- **H.264 encode** over VA-API: tightly-packed NV12 in, an Annex-B elementary
-  stream out (packed SPS/PPS + slice headers, low-latency IPPP, rate control).
+- **H.264 encode** over VA-API: an Annex-B elementary stream out (packed
+  SPS/PPS + slice headers, low-latency IPPP, CBR rate control whose bitrate can
+  change between frames, the color space labelled in the VUI). Three inputs:
+  tightly-packed NV12 from the CPU, an NV12 DMA-BUF at the encoder's size
+  encoded in place, and any other importable DMA-BUF (packed RGB, YUYV, NV12
+  at another size or in another color space) converted and scaled into the
+  encoder's surface on the GPU. NV12 and BGRX input are tested; the other
+  formats go through the same video processor call untested.
+  Checked on Intel Meteor Lake (iHD 26.1.5) by decoding with ffmpeg: luma
+  above 35 dB PSNR against the source, and RGB converted to BT.601 and BT.709
+  to within a few code values. These run as tests wherever ffmpeg and a VA-API
+  device are both present.
+- **DMA-BUF import and video post-processing.** `dmabuf` wraps a DRM PRIME
+  buffer as a surface without copying it; `vpp` blits one surface into another
+  through `VAEntrypointVideoProc`, scaling, converting, and re-tiling on the
+  way.
 - **H.264 decode** over VA-API: one Annex-B access unit in, tightly-packed NV12
   out, with in-stream parameter sets, a conformant DPB (reference marking,
   reordering, frame_num gaps), and mid-stream resolution changes. Progressive
@@ -45,8 +58,9 @@ pulled in as a git dependency.
 ## Layout
 
 - `src/` — libva bindings (`bindings`, `display`, `surface`, `buffer`, ...), the
-  H.264 bitstream layer (`bitstream_utils`, `codec::h264`), and the thin encode
-  and decode drivers (`encode`, `decode`).
+  H.264 bitstream layer (`bitstream_utils`, `codec::h264`), the thin encode
+  and decode drivers (`encode`, `decode`), DMA-BUF import (`dmabuf`), video
+  post-processing (`vpp`), and the color space both share (`color`).
 - `libva/` — vendored libva headers (checked in; refreshed by `just vendor`).
 - `build.rs` + `bindgen_gen.rs` + `libva-wrapper.h` — bindgen setup.
 

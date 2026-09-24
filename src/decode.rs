@@ -127,6 +127,35 @@ pub struct ExportedFrame {
 }
 
 impl ExportedFrame {
+	/// Exports `surface`, an NV12 picture from somewhere other than the decoder, the way the decoder exports its own.
+	///
+	/// A picture the video processor produced, such as a scaled copy of a
+	/// captured frame, then reaches its consumer with the same descriptor and
+	/// the same [`download`](Self::download) fallback as a decoded one, so one
+	/// consumer handles both. `timestamp` is carried through untouched.
+	///
+	/// # Errors
+	///
+	/// Fails when the surface is not NV12, cannot be synced, or the driver will
+	/// not export it.
+	pub fn from_surface(surface: Surface<()>, timestamp: u64) -> anyhow::Result<Self> {
+		surface.sync().map_err(|e| anyhow!("surface sync: {e:?}"))?;
+		let (width, height) = surface.size();
+		let descriptor = surface
+			.export_prime()
+			.map_err(|e| anyhow!("export the surface: {e:?}"))?;
+		if descriptor.fourcc != VA_FOURCC_NV12 {
+			anyhow::bail!("exported fourcc {:#010x}, expected NV12", descriptor.fourcc);
+		}
+		Ok(Self {
+			timestamp,
+			width,
+			height,
+			descriptor,
+			surface: Arc::new(surface),
+		})
+	}
+
 	/// Reads this picture back to client memory as tightly packed NV12.
 	///
 	/// The way back for a caller that took a descriptor and then found itself
